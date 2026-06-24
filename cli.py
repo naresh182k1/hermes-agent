@@ -8911,17 +8911,62 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             # installing a console StreamHandler in non-verbose mode.
 
     def _print_nous_credits_block(self) -> bool:
-        """Print the Nous credits magnitudes + monthly-grant gauge when a Nous account
+        """Print the Nous dollar balance block (two-bar view) when a Nous account
         is logged in. Returns True if it printed anything.
 
-        Delegates to the shared ``agent.account_usage.nous_credits_lines`` helper —
-        the single source for the /usage credits block across CLI, gateway, and TUI.
-        It's agent-independent (a portal fetch gated on "a Nous account is logged in",
-        NOT the inference-provider string), so /usage shows the block even in the TUI
+        Prefers the shared dollar usage model (``agent.billing_usage`` — two-bar
+        plan/top-up view, dollars-only, the /usage + /subscription source of
+        truth). Falls back to the legacy ``nous_credits_lines`` text only when the
+        model is unavailable. Agent-independent (a portal fetch gated on "a Nous
+        account is logged in"), so /usage shows the block even in the TUI
         slash-worker subprocess that resumes WITHOUT a live agent. Fail-open and
-        wall-clock-bounded inside the helper; also honors HERMES_DEV_CREDITS_FIXTURE
-        for offline testing — same behavior as every other surface.
+        wall-clock-bounded; honors HERMES_DEV_CREDITS_FIXTURE for offline testing.
         """
+        try:
+            from agent.billing_usage import build_usage_model, format_renews
+
+            usage = build_usage_model()
+        except Exception:
+            usage = None
+            format_renews = None  # type: ignore
+
+        if usage is not None and usage.available and format_renews is not None:
+            printed_any = False
+            plan = usage.plan_name or ("Free" if usage.status == "free" else None)
+            renews_display = getattr(usage, "renews_display", None) or format_renews(usage.renews_at)
+            renews = f" · renews {renews_display}" if renews_display else ""
+            if plan:
+                print()
+                _cprint(f"  {_b(f'Plan: {plan}{renews}')}")
+                printed_any = True
+
+            pb = usage.plan_bar
+            if pb is not None and pb.total_usd > 0:
+                bar, _ = self._billing_spend_bar(pb.spent_usd, pb.total_usd)
+                _pct_s = f" · {pb.pct_used}% used" if pb.pct_used is not None else ""
+                _label = (usage.plan_name or "plan").ljust(8)[:8]
+                print(f"  {_label}[{bar}]  ${pb.remaining_usd:,.2f} left of ${pb.total_usd:,.2f}{_pct_s}")
+                printed_any = True
+            tb = usage.topup_bar
+            if tb is not None and tb.remaining_usd > 0:
+                print(f"  {'top-up'.ljust(8)}[{'█' * 10}]  ${tb.remaining_usd:,.2f} · never expires")
+                printed_any = True
+            if usage.has_topup and usage.total_spendable_usd is not None:
+                print(f"  Total spendable: ${usage.total_spendable_usd:,.2f}")
+
+            if usage.status == "free":
+                _cprint(f"  {_d('> Free · free models only. Run /subscription to reach paid models.')}")
+                printed_any = True
+            elif usage.status == "low":
+                _amt = f"${usage.total_spendable_usd:,.2f}" if usage.total_spendable_usd is not None else "under $5"
+                _low = f"! Low balance · {_amt} left. Run /topup or /subscription."
+                _cprint(f"  {_low}")
+                printed_any = True
+
+            if printed_any:
+                return True
+
+        # Fallback: legacy text lines (only when the model is unavailable).
         from agent.account_usage import nous_credits_lines
 
         lines = nous_credits_lines()
@@ -8937,9 +8982,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         Mirrors the TUI's ``USAGE_CTA`` (``session.ts``) so every surface ends a
         usage read with the same nudge. Only called when a Nous account is logged
-        in (the credits block printed), since both commands are Nous-account only.
+        in (the balance block printed), since both commands are Nous-account only.
         """
-        _cprint(f"  {_d('Run /subscription to change plan · /topup to add credits')}")
+        _cprint(f"  {_d('Run /subscription to change plan · /topup to add to your balance')}")
 
     # ------------------------------------------------------------------
     # /subscription — view plan + change it in the browser (CLI surface)
@@ -8970,7 +9015,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 print("  Run `hermes portal` to log in, then /subscription.")
             return
 
-        # Team context: no personal plan — teams run on shared credits.
+        # Team context: no personal plan — teams run on a shared balance.
         if state.context == "team":
             print()
             _cprint(f"  ⚕ {_b('Team subscription')}")
@@ -8980,50 +9025,79 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 _org_line = f"Org: {state.org_name}{f' · {role}' if role else ''}"
                 _cprint(f"  {_d(_org_line)}")
             org = state.org_name or "a team org"
-            print(f"  This terminal is connected to {org}. Teams run on shared")
-            print("  credits — use /topup to add funds.")
+            print(f"  This terminal is connected to {org}. Teams run on a shared")
+            print("  balance · use /topup to add funds.")
             _cprint(f"  {_d('Personal subscriptions live on your personal account.')}")
             return
 
         self._subscription_overview(state, subscription_manage_url(state))
 
     def _subscription_overview(self, state, manage_url):
-        """Print the plan read block + tier list, then the browser hand-off."""
-        from agent.billing_view import format_money
+        """Print the plan read block, then the browser hand-off to manage it.
+
+        Dollars-only (no "credits") — mirrors the TUI overlay: a status line, the
+        shared two-bar dollar usage view (plan + top-up) with the plan name on
+        the bar, and state-matched free/low nudges. No in-terminal tier picker —
+        the only action is managing the subscription on the portal.
+        """
+        # Shared dollar usage model (the only source with top-up dollars).
+        from agent.billing_usage import format_renews
+        try:
+            from agent.billing_usage import build_usage_model
+
+            usage = build_usage_model()
+        except Exception:
+            usage = None
 
         c = state.current
         is_free = not (c and c.tier_id)
         can_change = state.can_change_plan and state.is_admin
 
-        print()
-        if is_free:
-            _cprint(f"  ⚕ {_b('Subscribe to a plan')}")
+        plan_name = (c.tier_name or c.tier_id) if c else (usage.plan_name if usage else None)
+        u_status = getattr(usage, "status", None) if usage else None
+        view_only = not can_change
+        renews_display = getattr(usage, "renews_display", None) if usage else None
+        if not renews_display and c and c.cycle_ends_at:
+            renews_display = format_renews(c.cycle_ends_at)
+
+        # Status line — dollars-only, no duplicated "of $Y" (the bar carries that).
+        if not plan_name:
+            status = "Plan: Free · free models only"
+        elif usage is not None and u_status == "low" and usage.total_spendable_usd is not None:
+            _tot = f"${usage.total_spendable_usd:,.2f}"
+            status = f"Plan: {plan_name} · {_tot} left"
         else:
-            _cprint(f"  ⚕ {_b(f'Your plan: {c.tier_name or c.tier_id}')}")
+            _spend = getattr(usage, "total_spendable_usd", None) if usage else None
+            _left = f" · ${_spend:,.2f} left" if _spend is not None else ""
+            _tail = " · view only" if view_only else (f" · renews {renews_display}" if renews_display else "")
+            status = f"Plan: {plan_name}{_left}{_tail}"
+
+        print()
+        _cprint(f"  ⚕ {_b(status)}")
         print(f"  {'─' * 41}")
 
-        # Usage bar from the subscription allowance (monthly vs remaining).
-        if c and c.monthly_credits and c.credits_remaining:
-            try:
-                monthly = float(c.monthly_credits)
-                remaining = float(c.credits_remaining)
-            except (TypeError, ValueError):
-                monthly = remaining = 0.0
-            if monthly > 0:
-                spent = max(0.0, monthly - remaining)
-                bar, pct = self._billing_spend_bar(spent, monthly)
-                # Credits are a COUNT, not money — grouped integers, no "$".
-                def _grp(v):
-                    try:
-                        return f"{int(float(v)):,}"
-                    except (TypeError, ValueError):
-                        return str(v)
-                print(
-                    f"  {_grp(c.credits_remaining)} of {_grp(c.monthly_credits)} "
-                    f"remaining   {bar} {100 - pct}% left"
-                )
-        if c and c.cycle_ends_at:
-            print(f"  Renews: {c.cycle_ends_at}")
+        # Two-bar dollar usage view — plan name labels the plan bar.
+        pb = getattr(usage, "plan_bar", None) if usage else None
+        if pb is not None and pb.total_usd > 0:
+            bar, _ = self._billing_spend_bar(pb.spent_usd, pb.total_usd)
+            _pct = pb.pct_used
+            _pct_s = f" · {_pct}% used" if _pct is not None else ""
+            _label = (plan_name or "plan").ljust(8)[:8]
+            print(f"  {_label}[{bar}]  ${pb.remaining_usd:,.2f} left of ${pb.total_usd:,.2f}{_pct_s}")
+        tb = getattr(usage, "topup_bar", None) if usage else None
+        if tb is not None and tb.remaining_usd > 0:
+            full = "█" * 10
+            print(f"  {'top-up'.ljust(8)}[{full}]  ${tb.remaining_usd:,.2f} · never expires")
+        if usage and getattr(usage, "has_topup", False) and getattr(usage, "total_spendable_usd", None) is not None:
+            print(f"  Total spendable: ${usage.total_spendable_usd:,.2f}")
+
+        # State-matched nudge (free upsell / low alert; healthy stays silent).
+        if is_free:
+            _cprint(f"  {_d('> Paid models need a subscription. Start one to reach them.')}")
+        elif u_status == "low":
+            _amt = f"${usage.total_spendable_usd:,.2f}" if usage is not None and usage.total_spendable_usd is not None else "under $5"
+            _low = f"! Low balance · {_amt} left. Top up or upgrade before a mid-run cutoff."
+            _cprint(f"  {_low}")
 
         if state.org_name:
             role = (state.role or "").title()
@@ -9033,30 +9107,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         # Headline precedence: cancel-scheduled > downgrade-pending.
         if c and c.cancel_at_period_end:
-            if c.cancellation_effective_at:
-                _cprint(f"  {_d(f'Cancels on {c.cancellation_effective_at} — your plan stays active until then.')}")
+            _eff = format_renews(c.cancellation_effective_at) if c.cancellation_effective_at else None
+            if _eff:
+                _cprint(f"  {_d(f'Cancels on {_eff} — your plan stays active until then.')}")
             else:
                 _cprint(f"  {_d('Cancellation scheduled — your plan stays active until the end of the billing period.')}")
         elif c and c.pending_downgrade_tier_name:
-            when = c.pending_downgrade_at or "the end of the cycle"
-            _cprint(f"  {_d(f'Scheduled to switch to {c.pending_downgrade_tier_name} on {when}.')}")
-
-        # Tier catalog (enabled tiers, current marked). Read-only for members.
-        enabled = [t for t in state.tiers if t.is_enabled]
-        if enabled:
-            print()
-            for t in enabled:
-                mark = "✓ " if t.is_current else "  "
-                price = format_money(t.dollars_per_month) if t.dollars_per_month is not None else "$0"
-                # Credits are a COUNT, not money — render grouped, no "$".
-                if t.monthly_credits is not None:
-                    try:
-                        credits = f"{int(t.monthly_credits):,}"
-                    except (TypeError, ValueError):
-                        credits = str(t.monthly_credits)
-                else:
-                    credits = "0"
-                _cprint(f"  {mark}{t.name} — {price}/mo ({credits} credits)")
+            _when = format_renews(c.pending_downgrade_at) or "the end of the cycle"
+            _cprint(f"  {_d(f'Scheduled to switch to {c.pending_downgrade_tier_name} on {_when}.')}")
 
         if not can_change:
             print()
@@ -9075,19 +9133,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # URL is the affordance, same discipline as _show_credits.
         if not getattr(self, "_app", None):
             print()
-            print(f"  Change plan: {manage_url}")
-            print("  Finish the change in your browser, then re-run /subscription.")
+            print(f"  Manage your subscription: {manage_url}")
+            print("  Open it in your browser, then re-run /subscription.")
             return
 
         print()
         choices = [
-            ("open", "Open subscription page", "change your plan in the browser"),
+            ("open", "Open subscription page", "manage your subscription in the browser"),
             ("copy", "Copy link", "copy the manage-subscription URL to your clipboard"),
             ("cancel", "Cancel", "do nothing"),
         ]
         raw = self._prompt_text_input_modal(
-            title="⚕ Change your plan?",
-            detail=f"Manage your subscription in your browser:\n{manage_url}",
+            title="⚕ Manage your subscription",
+            detail="Pick an option to manage your subscription in the browser.",
             choices=choices,
         )
         choice = self._normalize_slash_confirm_choice(raw, choices)
